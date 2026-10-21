@@ -83,6 +83,10 @@ func (c *testCluster) observe(e Event) {
 func (c *testCluster) onApply(id int, m ApplyMsg) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if m.Snapshot != nil {
+		c.byNode[id] = m.Index
+		return
+	}
 	if m.Index != c.byNode[id]+1 {
 		c.errs = append(c.errs, fmt.Sprintf("node %d applied %d after %d", id, m.Index, c.byNode[id]))
 	}
@@ -371,11 +375,8 @@ func chaos(t *testing.T, seed int64) {
 
 func TestFileStorageRecoversFromTornWrite(t *testing.T) {
 	dir := t.TempDir()
-	s, err := OpenFileStorage(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := s.Load(); err != nil {
+	s, _ := OpenFileStorage(dir)
+	if _, err := s.Load(); err != nil {
 		t.Fatal(err)
 	}
 	s.SetState(7, 3)
@@ -386,34 +387,95 @@ func TestFileStorageRecoversFromTornWrite(t *testing.T) {
 	s.Close()
 
 	// Simulate a crash in the middle of writing one more record.
-	f, _ := os.OpenFile(filepath.Join(dir, "wal"), os.O_APPEND|os.O_WRONLY, 0)
+	names, _ := filepath.Glob(filepath.Join(dir, "wal-*"))
+	f, _ := os.OpenFile(names[len(names)-1], os.O_APPEND|os.O_WRONLY, 0)
 	f.Write([]byte{1, 2, 3, 4, 1, 5, 0, 0})
 	f.Close()
 
 	s2, _ := OpenFileStorage(dir)
-	term, vote, log, err := s2.Load()
+	st, err := s2.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if term != 7 || vote != 3 {
-		t.Fatalf("state = %d/%d", term, vote)
+	if st.Term != 7 || st.VotedFor != 3 {
+		t.Fatalf("state = %d/%d", st.Term, st.VotedFor)
 	}
 	want := []Entry{{1, 1, []byte("a")}, {2, 1, []byte("b")}, {3, 3, []byte("c2")}, {4, 3, nil}}
-	if len(log) != len(want) {
-		t.Fatalf("log = %+v", log)
-	}
-	for i := range want {
-		if log[i].Index != want[i].Index || log[i].Term != want[i].Term || !bytes.Equal(log[i].Data, want[i].Data) {
-			t.Fatalf("entry %d = %+v, want %+v", i, log[i], want[i])
-		}
-	}
-	// New appends after recovery land after the cut.
+	checkEntries(t, st.Entries, want)
 	s2.Append([]Entry{{5, 3, []byte("e")}})
 	s2.Sync()
 	s2.Close()
 	s3, _ := OpenFileStorage(dir)
-	_, _, log, _ = s3.Load()
-	if len(log) != 5 || string(log[4].Data) != "e" {
-		t.Fatalf("after reopen: %+v", log)
+	st, _ = s3.Load()
+	checkEntries(t, st.Entries, append(want, Entry{5, 3, []byte("e")}))
+}
+
+func TestFileStorageSnapshotCompactsWAL(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := OpenFileStorage(dir)
+	s.Load()
+	for i := uint64(1); i <= 100; i++ {
+		s.Append([]Entry{{i, 1, []byte(fmt.Sprint(i))}})
+	}
+	s.Sync()
+	if err := s.SaveSnapshot(60, 1, []byte("state@60")); err != nil {
+		t.Fatal(err)
+	}
+	s.Append([]Entry{{101, 2, []byte("101")}})
+	s.Sync()
+	// The first segment still holds 61..100, so it must survive this snapshot
+	// and be deleted by one that covers it.
+	if err := s.SaveSnapshot(101, 2, []byte("state@101")); err != nil {
+		t.Fatal(err)
+	}
+	s.SaveSnapshot(50, 1, []byte("stale")) // ignored
+	s.Append([]Entry{{102, 2, []byte("102")}})
+	s.Sync()
+	s.Close()
+	names, _ := filepath.Glob(filepath.Join(dir, "wal-*"))
+	if len(names) != 1 {
+		t.Fatalf("segments after compaction: %v", names)
+	}
+	s2, _ := OpenFileStorage(dir)
+	st, err := s2.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SnapIndex != 101 || st.SnapTerm != 2 || string(st.Snapshot) != "state@101" {
+		t.Fatalf("snapshot = %d/%d/%q", st.SnapIndex, st.SnapTerm, st.Snapshot)
+	}
+	checkEntries(t, st.Entries, []Entry{{102, 2, []byte("102")}})
+}
+
+// A follower that installs a snapshot past the end of its log truncates and
+// then appends after a gap; replay must accept that.
+func TestFileStorageGapAfterInstalledSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := OpenFileStorage(dir)
+	s.Load()
+	s.Append([]Entry{{1, 1, nil}, {2, 1, nil}})
+	s.Sync()
+	s.SaveSnapshot(50, 3, []byte("snap"))
+	s.TruncateFrom(51)
+	s.Append([]Entry{{51, 3, []byte("x")}})
+	s.Sync()
+	s.Close()
+	s2, _ := OpenFileStorage(dir)
+	st, err := s2.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkEntries(t, st.Entries, []Entry{{51, 3, []byte("x")}})
+}
+
+func checkEntries(t *testing.T, got, want []Entry) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries %+v, want %+v", len(got), got, want)
+	}
+	for i := range want {
+		if got[i].Index != want[i].Index || got[i].Term != want[i].Term || !bytes.Equal(got[i].Data, want[i].Data) {
+			t.Fatalf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }

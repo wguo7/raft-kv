@@ -37,7 +37,13 @@ type Node struct {
 	term     uint64
 	votedFor int
 	leaderID int
-	log      []Entry // log[0] is a sentinel at index 0, term 0
+	// log[0] is a sentinel holding the index and term of the last entry
+	// covered by the snapshot (0, 0 when there is none); log[i] has index
+	// log[0].Index + i.
+	log []Entry
+	// snapshot is the latest state-machine snapshot (covers log[0].Index).
+	snapshot        []byte
+	pendingSnapshot bool // snapshot not yet delivered to the state machine
 
 	commitIndex uint64
 	lastApplied uint64
@@ -66,17 +72,18 @@ type Node struct {
 // background goroutines.
 func New(cfg Config) (*Node, error) {
 	cfg.setDefaults()
-	term, votedFor, entries, err := cfg.Storage.Load()
+	st, err := cfg.Storage.Load()
 	if err != nil {
 		return nil, err
 	}
 	n := &Node{
 		cfg:        cfg,
 		id:         cfg.ID,
-		term:       term,
-		votedFor:   votedFor,
+		term:       st.Term,
+		votedFor:   st.VotedFor,
 		leaderID:   noVote,
-		log:        append([]Entry{{}}, entries...),
+		log:        append([]Entry{{Index: st.SnapIndex, Term: st.SnapTerm}}, st.Entries...),
+		snapshot:   st.Snapshot,
 		nextIndex:  map[int]uint64{},
 		matchIndex: map[int]uint64{},
 		lastAck:    map[int]time.Time{},
@@ -86,6 +93,10 @@ func New(cfg Config) (*Node, error) {
 		stop:       make(chan struct{}),
 	}
 	n.durableIndex = n.lastIndex()
+	if st.SnapIndex > 0 {
+		n.commitIndex = st.SnapIndex
+		n.pendingSnapshot = true
+	}
 	n.applyCond = sync.NewCond(&n.mu)
 	n.resetElectionTimer()
 
@@ -168,7 +179,16 @@ func signal(ch chan struct{}) {
 func (n *Node) lastIndex() uint64 { return n.log[len(n.log)-1].Index }
 func (n *Node) lastTerm() uint64  { return n.log[len(n.log)-1].Term }
 
-func (n *Node) termAt(i uint64) uint64 { return n.log[i].Term }
+func (n *Node) snapIndex() uint64 { return n.log[0].Index }
+
+// termAt requires snapIndex <= i <= lastIndex.
+func (n *Node) termAt(i uint64) uint64 { return n.log[i-n.snapIndex()].Term }
+
+// entries returns a copy of the entries with indexes in [from, to).
+func (n *Node) entries(from, to uint64) []Entry {
+	s := n.snapIndex()
+	return append([]Entry(nil), n.log[from-s:to-s]...)
+}
 
 func (n *Node) quorum() int { return len(n.cfg.Peers)/2 + 1 }
 
@@ -183,15 +203,16 @@ func (n *Node) resetElectionTimer() {
 
 func (n *Node) emit(kind EventKind) {
 	if n.cfg.Observer != nil {
-		n.cfg.Observer(Event{Kind: kind, Node: n.id, Term: n.term, Candidate: n.votedFor, EntryAt: n.entryAt})
+		n.cfg.Observer(Event{Kind: kind, Node: n.id, Term: n.term, Candidate: n.votedFor,
+			SnapshotIndex: n.snapIndex(), EntryAt: n.entryAt})
 	}
 }
 
 func (n *Node) entryAt(i uint64) (Entry, bool) {
-	if i == 0 || i > n.lastIndex() {
+	if i <= n.snapIndex() || i > n.lastIndex() {
 		return Entry{}, false
 	}
-	return n.log[i], true
+	return n.log[i-n.snapIndex()], true
 }
 
 // setTermAndVote persists before the in-memory change becomes visible to any
@@ -458,8 +479,11 @@ func (n *Node) replicateOnce(peer int, trigger chan struct{}) {
 		return
 	}
 	next := n.nextIndex[peer]
-	if next < 1 {
-		next = 1
+	if next <= n.snapIndex() {
+		// The entries this peer needs were compacted away.
+		n.mu.Unlock()
+		n.sendSnapshot(peer, trigger)
+		return
 	}
 	end := n.lastIndex() + 1
 	if end-next > uint64(n.cfg.MaxBatch) {
@@ -470,7 +494,7 @@ func (n *Node) replicateOnce(peer int, trigger chan struct{}) {
 		LeaderID:     n.id,
 		PrevLogIndex: next - 1,
 		PrevLogTerm:  n.termAt(next - 1),
-		Entries:      append([]Entry(nil), n.log[next:end]...),
+		Entries:      n.entries(next, end),
 		LeaderCommit: n.commitIndex,
 	}
 	term := n.term
@@ -510,7 +534,7 @@ func (n *Node) replicateOnce(peer int, trigger chan struct{}) {
 	// Back up using the follower's conflict hint.
 	next = reply.ConflictIndex
 	if reply.ConflictTerm != 0 {
-		for i := n.lastIndex(); i > 0; i-- {
+		for i := n.lastIndex(); i > n.snapIndex(); i-- {
 			if n.termAt(i) == reply.ConflictTerm {
 				next = i + 1
 				break
@@ -582,10 +606,23 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 		reply.ConflictIndex = n.lastIndex() + 1
 		return reply, nil
 	}
-	if t := n.termAt(args.PrevLogIndex); t != args.PrevLogTerm {
+	// lastNew is the last index this RPC vouches for, computed before any
+	// entries already covered by our snapshot are skipped.
+	lastNew := args.PrevLogIndex + uint64(len(args.Entries))
+	prevIndex, prevTerm, newEntries := args.PrevLogIndex, args.PrevLogTerm, args.Entries
+	if snap := n.snapIndex(); prevIndex < snap {
+		// Everything up to snap is committed and so matches the leader.
+		skip := snap - prevIndex
+		if skip > uint64(len(newEntries)) {
+			skip = uint64(len(newEntries))
+		}
+		newEntries = newEntries[skip:]
+		prevIndex, prevTerm = snap, n.termAt(snap)
+	}
+	if t := n.termAt(prevIndex); t != prevTerm {
 		reply.ConflictTerm = t
-		i := args.PrevLogIndex
-		for i > 1 && n.termAt(i-1) == t {
+		i := prevIndex
+		for i > n.snapIndex()+1 && n.termAt(i-1) == t {
 			i--
 		}
 		reply.ConflictIndex = i
@@ -593,7 +630,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 	}
 
 	changed := false
-	for i, e := range args.Entries {
+	for i, e := range newEntries {
 		if e.Index <= n.lastIndex() {
 			if n.termAt(e.Index) == e.Term {
 				continue // already have it; a reordered RPC must not truncate
@@ -605,9 +642,9 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 			if err := n.cfg.Storage.TruncateFrom(e.Index); err != nil {
 				return nil, err
 			}
-			n.log = n.log[:e.Index]
+			n.log = n.log[:e.Index-n.snapIndex()]
 		}
-		rest := args.Entries[i:]
+		rest := newEntries[i:]
 		if err := n.cfg.Storage.Append(rest); err != nil {
 			return nil, err
 		}
@@ -617,7 +654,6 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 	}
 	// Sync even if nothing changed when the entries we are about to vouch for
 	// are not yet durable (e.g. written while we were leader, never synced).
-	lastNew := args.PrevLogIndex + uint64(len(args.Entries))
 	if changed || lastNew > n.durableIndex {
 		if err := n.cfg.Storage.Sync(); err != nil {
 			return nil, err
@@ -681,12 +717,24 @@ func (n *Node) applier() {
 	defer n.wg.Done()
 	for {
 		n.mu.Lock()
-		for n.lastApplied >= n.commitIndex && !n.stopped {
+		for n.lastApplied >= n.commitIndex && !n.pendingSnapshot && !n.stopped {
 			n.applyCond.Wait()
 		}
 		if n.stopped {
 			n.mu.Unlock()
 			return
+		}
+		if n.pendingSnapshot {
+			n.pendingSnapshot = false
+			msg := ApplyMsg{Index: n.snapIndex(), Term: n.log[0].Term, Snapshot: n.snapshot}
+			n.lastApplied = msg.Index
+			n.mu.Unlock()
+			select {
+			case n.cfg.ApplyCh <- msg:
+			case <-n.stop:
+				return
+			}
+			continue
 		}
 		// Copy a bounded batch: after a restart the backlog can be millions
 		// of entries, and copying it all under the lock stalls heartbeats
@@ -695,7 +743,7 @@ func (n *Node) applier() {
 		if end-n.lastApplied > applyBatch {
 			end = n.lastApplied + applyBatch
 		}
-		batch := append([]Entry(nil), n.log[n.lastApplied+1:end+1]...)
+		batch := n.entries(n.lastApplied+1, end+1)
 		n.mu.Unlock()
 
 		for _, e := range batch {
@@ -706,7 +754,149 @@ func (n *Node) applier() {
 			}
 		}
 		n.mu.Lock()
-		n.lastApplied = batch[len(batch)-1].Index
+		if last := batch[len(batch)-1].Index; last > n.lastApplied {
+			n.lastApplied = last
+		}
 		n.mu.Unlock()
 	}
+}
+
+// ---- snapshots ----
+
+// Snapshot tells the node that the state machine's state through index
+// (which the state machine has applied) is captured in data. The node persists it
+// and discards the log up to index.
+func (n *Node) Snapshot(index uint64, data []byte) error {
+	n.mu.Lock()
+	// The state machine only sees committed entries, so index <= commitIndex
+	// (lastApplied can lag: it advances after a whole batch is delivered).
+	if n.stopped || index <= n.snapIndex() || index > n.commitIndex || index > n.lastIndex() {
+		n.mu.Unlock()
+		return nil
+	}
+	term := n.termAt(index)
+	n.mu.Unlock()
+
+	// Writing the snapshot can take a while; do it without the lock.
+	if err := n.cfg.Storage.SaveSnapshot(index, term, data); err != nil {
+		return err
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if index <= n.snapIndex() {
+		return nil // a newer snapshot was installed meanwhile
+	}
+	n.compact(index, term)
+	n.snapshot = data
+	return nil
+}
+
+// compact drops entries through index, copying the rest into a fresh slice
+// so the old backing array can be freed.
+func (n *Node) compact(index, term uint64) {
+	var rest []Entry
+	if index < n.lastIndex() {
+		rest = n.log[index-n.snapIndex()+1:]
+	}
+	log := make([]Entry, 1, 1+len(rest)+1024)
+	log[0] = Entry{Index: index, Term: term}
+	n.log = append(log, rest...)
+}
+
+func (n *Node) sendSnapshot(peer int, trigger chan struct{}) {
+	n.mu.Lock()
+	if n.role != Leader || n.stopped {
+		n.mu.Unlock()
+		return
+	}
+	args := &InstallSnapshotArgs{
+		Term:              n.term,
+		LeaderID:          n.id,
+		LastIncludedIndex: n.snapIndex(),
+		LastIncludedTerm:  n.log[0].Term,
+		Data:              n.snapshot,
+	}
+	term := n.term
+	n.mu.Unlock()
+
+	// Snapshots are larger than normal RPCs; allow more time.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*n.cfg.RPCTimeout)
+	reply, err := n.cfg.Transport.InstallSnapshot(ctx, peer, args)
+	cancel()
+	if err != nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if reply.Term > n.term {
+		n.becomeFollower(reply.Term)
+		return
+	}
+	if n.term != term || n.role != Leader {
+		return
+	}
+	n.lastAck[peer] = time.Now()
+	if args.LastIncludedIndex > n.matchIndex[peer] {
+		n.matchIndex[peer] = args.LastIncludedIndex
+	}
+	if args.LastIncludedIndex+1 > n.nextIndex[peer] {
+		n.nextIndex[peer] = args.LastIncludedIndex + 1
+	}
+	n.advanceCommit()
+	signal(trigger)
+}
+
+// HandleInstallSnapshot is the receiver side of InstallSnapshot.
+func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return nil, ErrStopped
+	}
+	reply := &InstallSnapshotReply{Term: n.term}
+	if args.Term < n.term {
+		return reply, nil
+	}
+	if args.Term > n.term || n.role != Follower {
+		if err := n.becomeFollower(args.Term); err != nil {
+			return nil, err
+		}
+		reply.Term = n.term
+	}
+	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now()
+	n.resetElectionTimer()
+
+	idx := args.LastIncludedIndex
+	if idx <= n.commitIndex {
+		return reply, nil // we already have everything it covers
+	}
+	if err := n.cfg.Storage.SaveSnapshot(idx, args.LastIncludedTerm, args.Data); err != nil {
+		return nil, err
+	}
+	if idx <= n.lastIndex() && n.termAt(idx) == args.LastIncludedTerm {
+		// Our log agrees through idx: keep what follows.
+		n.compact(idx, args.LastIncludedTerm)
+	} else {
+		// Our log conflicts with or ends before the snapshot: discard it.
+		if err := n.cfg.Storage.TruncateFrom(idx + 1); err != nil {
+			return nil, err
+		}
+		if err := n.cfg.Storage.Sync(); err != nil {
+			return nil, err
+		}
+		n.log = make([]Entry, 1, 1024)
+		n.log[0] = Entry{Index: idx, Term: args.LastIncludedTerm}
+	}
+	if n.durableIndex < idx || n.durableIndex > n.lastIndex() {
+		n.durableIndex = n.lastIndex()
+	}
+	n.snapshot = args.Data
+	n.commitIndex = idx
+	n.pendingSnapshot = true
+	n.applyCond.Broadcast()
+	n.lastLeaderContact = time.Now()
+	n.resetElectionTimer()
+	return reply, nil
 }

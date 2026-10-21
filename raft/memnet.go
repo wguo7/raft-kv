@@ -24,6 +24,7 @@ type MemNetwork struct {
 type Handler interface {
 	HandleRequestVote(*RequestVoteArgs) (*RequestVoteReply, error)
 	HandleAppendEntries(*AppendEntriesArgs) (*AppendEntriesReply, error)
+	HandleInstallSnapshot(*InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
 
 var ErrUnreachable = errors.New("memnet: unreachable")
@@ -162,4 +163,8 @@ func (e *memEndpoint) AppendEntries(ctx context.Context, to int, args *AppendEnt
 	cp := *args
 	cp.Entries = append([]Entry(nil), args.Entries...)
 	return call(ctx, e, to, &cp, Handler.HandleAppendEntries)
+}
+
+func (e *memEndpoint) InstallSnapshot(ctx context.Context, to int, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	return call(ctx, e, to, args, Handler.HandleInstallSnapshot)
 }

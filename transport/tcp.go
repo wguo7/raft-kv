@@ -50,6 +50,15 @@ func (s *service) AppendEntries(args *raft.AppendEntriesArgs, reply *raft.Append
 	return nil
 }
 
+func (s *service) InstallSnapshot(args *raft.InstallSnapshotArgs, reply *raft.InstallSnapshotReply) error {
+	r, err := s.h.HandleInstallSnapshot(args)
+	if err != nil {
+		return err
+	}
+	*reply = *r
+	return nil
+}
+
 // TCP is a raft.Transport that dials peers lazily and redials after a
 // connection error or timeout.
 type TCP struct {
@@ -125,4 +134,9 @@ func (t *TCP) RequestVote(ctx context.Context, to int, args *raft.RequestVoteArg
 func (t *TCP) AppendEntries(ctx context.Context, to int, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	var r raft.AppendEntriesReply
 	return &r, t.call(ctx, to, "Raft.AppendEntries", args, &r)
+}
+
+func (t *TCP) InstallSnapshot(ctx context.Context, to int, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	var r raft.InstallSnapshotReply
+	return &r, t.call(ctx, to, "Raft.InstallSnapshot", args, &r)
 }
