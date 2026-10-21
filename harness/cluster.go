@@ -27,6 +27,7 @@ type Cluster struct {
 	leaders  map[uint64]int    // term -> leader
 	elected  int               // number of elections won
 	votes    map[[2]uint64]int // (term, voter) -> candidate
+	restored int               // snapshots delivered to state machines
 	errs     []string
 }
 
@@ -36,9 +37,12 @@ type Timing struct {
 	// leader's backlog one entry at a time, which exposes commit-rule bugs
 	// that large batches hide.
 	MaxBatch int
+	// SnapshotEvery compacts the log every this many entries (0 = never).
+	// Small values force lagging and restarted nodes through InstallSnapshot.
+	SnapshotEvery uint64
 }
 
-var DefaultTiming = Timing{20 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 0}
+var DefaultTiming = Timing{Heartbeat: 20 * time.Millisecond, ElectionMin: 100 * time.Millisecond, ElectionMax: 200 * time.Millisecond}
 
 func NewCluster(n int, seed int64, timing Timing) *Cluster {
 	c := &Cluster{
@@ -68,7 +72,7 @@ func (c *Cluster) IDs() []int { return c.ids }
 func (c *Cluster) Start(id int) {
 	raw := make(chan raft.ApplyMsg, 256)
 	toKV := make(chan raft.ApplyMsg, 256)
-	srv := kv.NewServer(toKV)
+	srv := kv.NewServer(toKV, c.timing.SnapshotEvery)
 	node, err := raft.New(raft.Config{
 		ID: id, Peers: c.ids,
 		HeartbeatInterval:  c.timing.Heartbeat,
@@ -142,6 +146,9 @@ func (c *Cluster) observe(e raft.Event) {
 	// Leader completeness: a new leader's log holds every entry any node has
 	// applied (applied implies committed).
 	for idx, data := range c.log {
+		if idx <= e.SnapshotIndex {
+			continue // compacted; covered by its snapshot
+		}
 		if got, ok := e.EntryAt(idx); !ok || !bytes.Equal(got.Data, data) {
 			c.errs = append(c.errs, fmt.Sprintf("leader completeness: node %d leads term %d without committed index %d", e.Node, e.Term, idx))
 			break
@@ -160,6 +167,14 @@ func (c *Cluster) recordApply(id int, node *raft.Node, m raft.ApplyMsg) {
 	if c.nodes[id] != node {
 		return // stale goroutine of a crashed incarnation
 	}
+	if m.Snapshot != nil {
+		if m.Index < c.appliedN[id] {
+			c.errs = append(c.errs, fmt.Sprintf("node %d installed snapshot %d after applying %d", id, m.Index, c.appliedN[id]))
+		}
+		c.appliedN[id] = m.Index
+		c.restored++
+		return
+	}
 	if m.Index != c.appliedN[id]+1 {
 		c.errs = append(c.errs, fmt.Sprintf("node %d applied index %d after %d", id, m.Index, c.appliedN[id]))
 	}
@@ -174,6 +189,12 @@ func (c *Cluster) Errors() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.errs...)
+}
+
+func (c *Cluster) SnapshotsRestored() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.restored
 }
 
 func (c *Cluster) Elections() int {

@@ -30,7 +30,7 @@ func TestJepsen(t *testing.T) {
 	if testing.Short() {
 		seeds = 2
 	}
-	var totalOps, unknown, elections atomic.Int64
+	var totalOps, unknown, elections, restored atomic.Int64
 	for i := 0; i < seeds; i++ {
 		seed := *flagFirst + int64(i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
@@ -39,15 +39,16 @@ func TestJepsen(t *testing.T) {
 			totalOps.Add(int64(r.ops))
 			unknown.Add(int64(r.unknown))
 			elections.Add(int64(r.elections))
+			restored.Add(int64(r.restored))
 		})
 	}
 	t.Cleanup(func() {
-		t.Logf("%d runs, %d client ops (%d with unknown outcome), %d elections",
-			seeds, totalOps.Load(), unknown.Load(), elections.Load())
+		t.Logf("%d runs, %d client ops (%d with unknown outcome), %d elections, %d snapshots restored",
+			seeds, totalOps.Load(), unknown.Load(), elections.Load(), restored.Load())
 	})
 }
 
-type runResult struct{ ops, unknown, elections int }
+type runResult struct{ ops, unknown, elections, restored int }
 
 type nemesis struct {
 	name string
@@ -164,6 +165,7 @@ var nemeses = []nemesis{
 func runOnce(t *testing.T, seed int64, dur time.Duration) runResult {
 	timing := DefaultTiming
 	timing.MaxBatch = []int{1, 2, 8, 4096}[seed%4]
+	timing.SnapshotEvery = []uint64{0, 16, 128, 1024}[(seed/4)%4]
 	c := NewCluster(5, seed, timing)
 	defer c.Shutdown()
 	rng := rand.New(rand.NewSource(seed))
@@ -260,5 +262,5 @@ func runOnce(t *testing.T, seed int64, dur time.Duration) runResult {
 	case porcupine.Unknown:
 		t.Logf("seed %d: linearizability check timed out", seed)
 	}
-	return runResult{ops: len(history), unknown: unknown, elections: c.Elections()}
+	return runResult{ops: len(history), unknown: unknown, elections: c.Elections(), restored: c.SnapshotsRestored()}
 }
