@@ -26,6 +26,8 @@ var ErrStopped = errors.New("raft: node stopped")
 
 const noVote = -1
 
+const applyBatch = 1024
+
 type Node struct {
 	cfg Config
 	id  int
@@ -232,6 +234,8 @@ func (n *Node) ticker() {
 		}
 		n.mu.Lock()
 		if n.role != Leader && time.Now().After(n.electionDeadline) {
+			n.cfg.Logf("node %d: election timeout in term %d, %v since leader contact",
+				n.id, n.term, time.Since(n.lastLeaderContact).Round(time.Millisecond))
 			n.resetElectionTimer()
 			n.wg.Add(1)
 			go func() {
@@ -279,6 +283,7 @@ func (n *Node) campaign() {
 		n.mu.Unlock()
 		return
 	}
+	n.cfg.Logf("node %d: won pre-vote, starting election for term %d", n.id, n.term+1)
 	if err := n.setTermAndVote(n.term+1, n.id); err != nil {
 		n.cfg.Logf("node %d: persist vote: %v", n.id, err)
 		n.mu.Unlock()
@@ -683,7 +688,14 @@ func (n *Node) applier() {
 			n.mu.Unlock()
 			return
 		}
-		batch := append([]Entry(nil), n.log[n.lastApplied+1:n.commitIndex+1]...)
+		// Copy a bounded batch: after a restart the backlog can be millions
+		// of entries, and copying it all under the lock stalls heartbeats
+		// long enough to trigger elections.
+		end := n.commitIndex
+		if end-n.lastApplied > applyBatch {
+			end = n.lastApplied + applyBatch
+		}
+		batch := append([]Entry(nil), n.log[n.lastApplied+1:end+1]...)
 		n.mu.Unlock()
 
 		for _, e := range batch {
