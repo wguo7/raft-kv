@@ -102,12 +102,16 @@ const (
 	EventBecameLeader EventKind = iota
 	EventBecameFollower
 	EventBecameCandidate
+	EventVoted // Node granted its vote in Term to Candidate
 )
 
 type Event struct {
-	Kind EventKind
-	Node int
-	Term uint64
+	Kind      EventKind
+	Node      int
+	Term      uint64
+	Candidate int
+	// EntryAt reads the node's log. It is only valid during the callback.
+	EntryAt func(index uint64) (Entry, bool)
 }
 
 func (c *Config) setDefaults() {

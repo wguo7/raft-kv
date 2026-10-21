@@ -181,8 +181,15 @@ func (n *Node) resetElectionTimer() {
 
 func (n *Node) emit(kind EventKind) {
 	if n.cfg.Observer != nil {
-		n.cfg.Observer(Event{Kind: kind, Node: n.id, Term: n.term})
+		n.cfg.Observer(Event{Kind: kind, Node: n.id, Term: n.term, Candidate: n.votedFor, EntryAt: n.entryAt})
 	}
+}
+
+func (n *Node) entryAt(i uint64) (Entry, bool) {
+	if i == 0 || i > n.lastIndex() {
+		return Entry{}, false
+	}
+	return n.log[i], true
 }
 
 // setTermAndVote persists before the in-memory change becomes visible to any
@@ -387,6 +394,7 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs) (*RequestVoteReply, erro
 		// candidate with a stale log keep a better candidate from timing out.
 		n.resetElectionTimer()
 		reply.VoteGranted = true
+		n.emit(EventVoted)
 	}
 	return reply, nil
 }
