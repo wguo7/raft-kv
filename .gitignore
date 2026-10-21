@@ -1,0 +1,12 @@
+NOW.md
+CLAUDE.md
+AGENTS.md
+DECISIONS.md
+LOG.md
+STATUS.md
+.claude/
+.cursor/
+/bin/
+/results/raw/
+*.test
+*.out
