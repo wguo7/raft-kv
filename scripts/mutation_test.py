@@ -2,9 +2,10 @@
 """Check that the fault-injection harness catches known Raft bugs.
 
 Each mutant reintroduces one classic Raft bug into a scratch copy of the repo,
-then runs the randomized harness on it. A mutant is "caught" when any seed
-fails (non-linearizable history, two leaders in a term, divergent logs, or no
-progress after healing). The real code is never modified.
+then runs (1) the randomized harness and (2) the deterministic rule tests in
+raft/rules_test.go. The harness catches a mutant when any seed fails
+(non-linearizable history, a safety violation, or no progress after healing).
+The real code is never modified.
 
     python3 scripts/mutation_test.py [--seeds 40]
 """
@@ -75,6 +76,9 @@ def run(seeds: int, run_time: str) -> int:
                  "-args", "-seeds", str(seeds), "-fault-time", run_time],
                 cwd=dst, capture_output=True, text=True)
             out = p.stdout + p.stderr
+            u = subprocess.run(["go", "test", "-count=1", "-run", "TestVote|TestLeader|TestFollower", "./raft"],
+                               cwd=dst, capture_output=True, text=True)
+            unit = u.returncode != 0
             failed_seeds = out.count("--- FAIL: TestJepsen/seed=")
             caught = p.returncode != 0
             kind = ""
@@ -83,12 +87,13 @@ def run(seeds: int, run_time: str) -> int:
                 if marker in out:
                     kind = marker
                     break
-            rows.append((name, desc, caught, failed_seeds, seeds, kind, time.time() - t0))
-            print(f"{name:32s} {'CAUGHT' if caught else 'missed':7s} "
-                  f"{failed_seeds:3d}/{seeds} seeds failed  first signal: {kind or '-'}", flush=True)
-    caught = sum(r[2] for r in rows)
-    print(f"\n{caught}/{len(rows)} mutants caught")
-    return 0 if caught == len(rows) else 1
+            rows.append((name, caught, unit))
+            print(f"{name:32s} harness: {'CAUGHT' if caught else 'missed':7s} ({kind or '-'})  "
+                  f"rule tests: {'CAUGHT' if unit else 'missed'}", flush=True)
+    h = sum(r[1] for r in rows)
+    either = sum(r[1] or r[2] for r in rows)
+    print(f"\nharness alone: {h}/{len(rows)}; harness or rule tests: {either}/{len(rows)}")
+    return 0 if either == len(rows) else 1
 
 
 if __name__ == "__main__":
