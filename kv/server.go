@@ -4,8 +4,10 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"sync"
@@ -80,8 +82,9 @@ type session struct {
 }
 
 type applied struct {
-	term   uint64
-	result Result
+	term    uint64
+	result  Result
+	unknown bool // replaced by a snapshot: may or may not have applied
 }
 
 type waiter struct {
@@ -99,16 +102,21 @@ type Server struct {
 	waiters     map[uint64]waiter
 	lastApplied uint64
 	done        chan struct{}
+
+	snapshotEvery uint64 // entries between snapshots; 0 disables them
+	lastSnapshot  uint64
 }
 
 // NewServer consumes applyCh (the channel given to the raft node) until it is
-// closed or Close is called.
-func NewServer(applyCh <-chan raft.ApplyMsg) *Server {
+// closed or Close is called. Every snapshotEvery applied entries it hands the
+// node a snapshot so the log can be compacted (0 disables snapshots).
+func NewServer(applyCh <-chan raft.ApplyMsg, snapshotEvery uint64) *Server {
 	s := &Server{
-		data:     map[string]string{},
-		sessions: map[uint64]session{},
-		waiters:  map[uint64]waiter{},
-		done:     make(chan struct{}),
+		snapshotEvery: snapshotEvery,
+		data:          map[string]string{},
+		sessions:      map[uint64]session{},
+		waiters:       map[uint64]waiter{},
+		done:          make(chan struct{}),
 	}
 	go s.applyLoop(applyCh)
 	return s
@@ -139,6 +147,9 @@ func (s *Server) Submit(ctx context.Context, cmd Command) (Result, error) {
 
 	select {
 	case a := <-ch:
+		if a.unknown {
+			return Result{}, ErrTimeout
+		}
 		if a.term != term {
 			return Result{}, ErrLeadershipLost
 		}
@@ -166,8 +177,11 @@ func (s *Server) applyLoop(applyCh <-chan raft.ApplyMsg) {
 }
 
 func (s *Server) apply(m raft.ApplyMsg) {
+	if m.Snapshot != nil {
+		s.restore(m)
+		return
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.lastApplied = m.Index
 	var res Result
 	if m.Data != nil {
@@ -180,6 +194,65 @@ func (s *Server) apply(m raft.ApplyMsg) {
 	if w, ok := s.waiters[m.Index]; ok {
 		delete(s.waiters, m.Index)
 		w.ch <- applied{term: m.Term, result: res}
+	}
+	var snap []byte
+	if s.snapshotEvery > 0 && m.Index-s.lastSnapshot >= s.snapshotEvery {
+		snap = s.encodeState()
+		s.lastSnapshot = m.Index
+	}
+	s.mu.Unlock()
+	if snap != nil {
+		// Outside s.mu: the node writes the snapshot to disk. State cannot
+		// change meanwhile because only this goroutine applies entries.
+		if err := s.node.Snapshot(m.Index, snap); err != nil {
+			panic(fmt.Sprintf("kv: save snapshot: %v", err))
+		}
+	}
+}
+
+// snapState is the serialized form of the state machine.
+type snapState struct {
+	Data    map[string]string
+	Seqs    map[uint64]uint64
+	Results map[uint64]Result
+}
+
+func (s *Server) encodeState() []byte {
+	st := snapState{Data: s.data, Seqs: map[uint64]uint64{}, Results: map[uint64]Result{}}
+	for id, sess := range s.sessions {
+		st.Seqs[id], st.Results[id] = sess.seq, sess.result
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(st); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// restore replaces the state with a snapshot from the leader or from disk.
+func (s *Server) restore(m raft.ApplyMsg) {
+	var st snapState
+	if err := gob.NewDecoder(bytes.NewReader(m.Snapshot)).Decode(&st); err != nil {
+		panic(fmt.Sprintf("kv: bad snapshot: %v", err))
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data = st.Data
+	if s.data == nil {
+		s.data = map[string]string{}
+	}
+	s.sessions = map[uint64]session{}
+	for id, seq := range st.Seqs {
+		s.sessions[id] = session{seq: seq, result: st.Results[id]}
+	}
+	s.lastApplied, s.lastSnapshot = m.Index, m.Index
+	// Commands waiting on indexes the snapshot covers may or may not be in
+	// it; their clients must retry (the session table dedups the retry).
+	for idx, w := range s.waiters {
+		if idx <= m.Index {
+			delete(s.waiters, idx)
+			w.ch <- applied{unknown: true}
+		}
 	}
 }
 

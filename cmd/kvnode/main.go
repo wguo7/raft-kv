@@ -28,6 +28,7 @@ func main() {
 	elMin := flag.Duration("election-min", 150*time.Millisecond, "minimum election timeout")
 	elMax := flag.Duration("election-max", 300*time.Millisecond, "maximum election timeout")
 	timeout := flag.Duration("request-timeout", time.Second, "max wait for a client command to commit")
+	snapEvery := flag.Uint64("snapshot-every", 100000, "take a snapshot and compact the log every N entries (0 = never)")
 	verbose := flag.Bool("v", false, "log raft events")
 	flag.Parse()
 
@@ -48,7 +49,7 @@ func main() {
 		log.Fatal(err)
 	}
 	applyCh := make(chan raft.ApplyMsg, 4096)
-	srv := kv.NewServer(applyCh)
+	srv := kv.NewServer(applyCh, *snapEvery)
 	cfg := raft.Config{
 		ID: *id, Peers: peers,
 		HeartbeatInterval:  *heartbeat,
