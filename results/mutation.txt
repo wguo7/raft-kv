@@ -1,0 +1,9 @@
+vote-ignores-log-freshness       harness: CAUGHT  (panic)  rule tests: missed
+double-vote                      harness: CAUGHT  (election safety)  rule tests: CAUGHT
+vote-not-persisted               harness: CAUGHT  (state machine safety)  rule tests: CAUGHT
+commit-old-term-by-count         harness: missed  (-)  rule tests: CAUGHT
+follower-commit-past-verified    harness: missed  (-)  rule tests: CAUGHT
+ack-before-fsync                 harness: CAUGHT  (panic)  rule tests: missed
+no-dedup                         harness: CAUGHT  (not linearizable)  rule tests: missed
+
+harness alone: 5/7; harness or rule tests: 7/7

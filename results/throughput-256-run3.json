@@ -1,0 +1,13 @@
+{
+  "clients": 256,
+  "errors": 0,
+  "max_ms": 72.34,
+  "new_terms": 0,
+  "p50_ms": 3.34,
+  "p999_ms": 59.832,
+  "p99_ms": 9.026,
+  "seconds": 19.997483507,
+  "value_size": 64,
+  "writes": 1341486,
+  "writes_per_sec": 67082.74066236489
+}
