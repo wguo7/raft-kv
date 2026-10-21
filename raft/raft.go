@@ -618,6 +618,11 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) (*AppendEntriesReply
 			return nil, err
 		}
 		n.durableIndex = n.lastIndex()
+		// The fsync ran under the lock and may have been slow; restart the
+		// timer so this follower does not campaign against a live leader the
+		// moment the lock is released.
+		n.lastLeaderContact = time.Now()
+		n.resetElectionTimer()
 	}
 
 	// Commit only up to the last entry this RPC vouched for: anything past it
